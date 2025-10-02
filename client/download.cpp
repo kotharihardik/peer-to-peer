@@ -16,12 +16,45 @@
 
 using namespace std;
 
-// External SHA1 function
+
+// Global download tracking
+map<string, DownloadInfo> activeDownloads;
+mutex downloadsMutex;
+
+// Generate unique key for download
+string getDownloadKey(const string& groupId, const string& filename) {
+    return groupId + "::" + filename;
+}
+
+// Show all downloads (both active and completed)
+string showDownloads() {
+    lock_guard<mutex> lock(downloadsMutex);
+    
+    if (activeDownloads.empty()) {
+        return "No downloads\n";
+    }
+    
+    ostringstream oss;
+    
+    for (const auto& pair : activeDownloads) {
+        const DownloadInfo& dl = pair.second;
+        
+        // Format: [Status] [groupId] filename
+        if (dl.status == COMPLETED) {
+            oss << "[C] [" << dl.groupId << "] " << dl.filename << "\n";
+        } else if (dl.status == DOWNLOADING) {
+            oss << "[D] [" << dl.groupId << "] " << dl.filename << "\n";
+        }
+        // Skip FAILED status in output (or you can show it as [F])
+    }
+    
+    return oss.str();
+}
+
 extern string calculateSHA1(const unsigned char* data, size_t len);
 
 // Rarest-first piece selection
 int selectRarestPiece(const vector<bool>& downloaded, const vector<Seeder>& seeders, int totalPieces) {
-    // Count how many seeders have each piece
     map<int, int> pieceAvailability;
     
     for (int i = 0; i < totalPieces; i++) {
@@ -50,20 +83,25 @@ int selectRarestPiece(const vector<bool>& downloaded, const vector<Seeder>& seed
         }
     }
     
-    cout << "[PIECE_SELECT] Selected piece " << rarestPiece 
-         << " (rarity: " << minCount << " seeders)" << endl;
-    
     return rarestPiece;
 }
 
 // Download single piece from a peer
 bool downloadPieceFromPeer(const string& ip, int port, const string& filepath, 
                            int pieceIndex, vector<unsigned char>& pieceData, 
-                           const string& expectedHash, long long expectedSize) {
+                           const string& expectedHash, long long expectedSize,
+                           const string& downloadKey) {
     
-    cout << "[DOWNLOAD] Attempting piece " << pieceIndex << " from " 
-         << ip << ":" << port << endl;
-    cout << "[DOWNLOAD]   Filepath: " << filepath << endl;
+    // Check if stop requested
+    {
+        lock_guard<mutex> lock(downloadsMutex);
+        if (activeDownloads.count(downloadKey) && activeDownloads[downloadKey].stopRequested) {
+            cout << "[STOPPED] Download cancelled during piece " << pieceIndex << endl;
+            return false;
+        }
+    }
+    
+    cout << "[DOWNLOAD] Attempting piece " << pieceIndex << " from " << ip << ":" << port << endl;
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -93,8 +131,6 @@ bool downloadPieceFromPeer(const string& ip, int port, const string& filepath,
     req << "GET_PIECE " << filepath << " " << pieceIndex << "\n";
     string request = req.str();
     
-    cout << "[SEND] " << request;
-    
     if (send(sock, request.c_str(), request.size(), 0) < 0) {
         cerr << "[ERROR] Send failed" << endl;
         close(sock);
@@ -110,8 +146,6 @@ bool downloadPieceFromPeer(const string& ip, int port, const string& filepath,
         return false;
     }
     
-    cout << "[RECV] Piece size: " << pieceSize << " bytes" << endl;
-    
     if (pieceSize <= 0 || pieceSize > PIECE_SIZE) {
         cerr << "[ERROR] Invalid piece size: " << pieceSize << endl;
         close(sock);
@@ -125,17 +159,11 @@ bool downloadPieceFromPeer(const string& ip, int port, const string& filepath,
     while (totalReceived < pieceSize) {
         n = recv(sock, pieceData.data() + totalReceived, pieceSize - totalReceived, 0);
         if (n <= 0) {
-            cerr << "[ERROR] Connection lost at " << totalReceived 
-                 << "/" << pieceSize << " bytes" << endl;
+            cerr << "[ERROR] Connection lost at " << totalReceived << "/" << pieceSize << " bytes" << endl;
             close(sock);
             return false;
         }
         totalReceived += n;
-        
-        if (totalReceived % (100*1024) == 0 || totalReceived == pieceSize) {
-            cout << "[PROGRESS] Received " << totalReceived << "/" << pieceSize 
-                 << " bytes (" << (totalReceived * 100 / pieceSize) << "%)" << endl;
-        }
     }
     
     close(sock);
@@ -143,60 +171,50 @@ bool downloadPieceFromPeer(const string& ip, int port, const string& filepath,
     // Verify piece hash
     string computedHash = calculateSHA1(pieceData.data(), pieceData.size());
     
-    cout << "[VERIFY] Expected: " << expectedHash << endl;
-    cout << "[VERIFY] Computed: " << computedHash << endl;
-    
     if (computedHash != expectedHash) {
         cerr << "[ERROR] Hash mismatch for piece " << pieceIndex << endl;
         return false;
     }
     
-    cout << "[SUCCESS] Piece " << pieceIndex << " downloaded and verified (" 
-         << pieceSize << " bytes)" << endl;
-    cout << "-------------------------------------------" << endl;
+    cout << "[SUCCESS] Piece " << pieceIndex << " downloaded and verified (" << pieceSize << " bytes)" << endl;
     
     return true;
 }
 
-string recvAllMetadata(int sockfd, int num_chunks) {
+// Fixed metadata receiver - reads until "END\n"
+string recvMetadataUntilEnd(int sockfd) {
     string response;
-    char buf[32768];
-    int n;
-
-    // keep reading until we collect enough tokens
+    char buffer[8192];
+    
     while (true) {
-        n = recv(sockfd, buf, sizeof(buf), 0);
-        if (n <= 0) break; // connection closed
-        response.append(buf, n);
-
-        // quick check: count how many tokens we got
-        int tokenCount = 0;
-        for (char c : response) {
-            if (isspace(c)) tokenCount++;
-        }
-
-        // (filesize + num_chunks + all hashes)
-        // we need at least num_chunks + 2 tokens
-        if (tokenCount >= num_chunks + 2) {
+        ssize_t n = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+        if (n <= 0) break;
+        
+        buffer[n] = '\0';
+        response.append(buffer, n);
+        
+        // Check if we received END marker
+        if (response.find("END\n") != string::npos) {
             break;
         }
     }
-
+    
     return response;
 }
 
-
-// Main download function
+// Main download function with stop support
 void downloadFile(string trackerIP, int trackerPort, string groupId, 
                  string filename, string destPath) {
     
-    cout << "\n==========================================" << endl;
-    cout << "        STARTING DOWNLOAD                  " << endl;
-    cout << "==========================================" << endl;
-    cout << "[INFO] File: " << filename << endl;
-    cout << "[INFO] Group: " << groupId << endl;
-    cout << "[INFO] Destination: " << destPath << endl;
-    cout << "==========================================\n" << endl;
+    string downloadKey = getDownloadKey(groupId, filename);
+    
+    cout << "\n==========================================\n";
+    cout << "        STARTING DOWNLOAD\n";
+    cout << "==========================================\n";
+    cout << "[INFO] File: " << filename << "\n";
+    cout << "[INFO] Group: " << groupId << "\n";
+    cout << "[INFO] Destination: " << destPath << "\n";
+    cout << "==========================================\n\n";
     
     // Connect to tracker
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -222,31 +240,8 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
     string cmd = "download_file " + groupId + " " + filename + "\n";
     send(sock, cmd.c_str(), cmd.size(), 0);
     
-    // Receive metadata (may be large response)
-    string response;
-    char buffer[8192];
-    while (true) {
-        ssize_t n = recv(sock, buffer, sizeof(buffer), 0);
-
-        cout << "inside loop ------" << endl;
-        if (n < 0) { cerr << "recv failed\n"; break; }
-        if (n == 0) break;  // socket closed
-        response.append(buffer, n);
-        cout << response << endl;
-    }
-
-    
-//    string response;
-//     char buffer[8192];
-//     while (true) {
-//         ssize_t n = recv(sock, buffer, sizeof(buffer), 0);
-//         if (n <= 0) break;  // stop on error or EOF
-//         response.append(buffer, n);
-//     }
-
-
-    cout << "response --" << response;
-
+    // Receive metadata until END marker
+    string response = recvMetadataUntilEnd(sock);
     close(sock);
     
     if (response.empty()) {
@@ -254,91 +249,118 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
         return;
     }
     
-    cout << "[TRACKER] Received metadata (" << response.size() << " bytes)" << endl;
-
-    // cout << "meta data ---" << response << endl;
+    cout << "[TRACKER] Received metadata" << endl;
     
+    // Parse metadata
     stringstream ss(response);
     string line;
-
-    // First line: filesize pieceCount fileSha1
+    
+    // First line: OK filesize pieceCount fileSha1
     if (!getline(ss, line)) {
         cerr << "[ERROR] Invalid metadata format" << endl;
         return;
     }
-
-    stringstream liness(line);
+    
+    stringstream firstLine(line);
+    string okMarker;
     long long filesize;
     int pieceCount;
     string fileSha1;
-    liness >> filesize >> pieceCount >> fileSha1;
-
-    // Second line: piece hashes
-    if (!getline(ss, line)) {
-        cerr << "[ERROR] Missing piece hashes" << endl;
+    firstLine >> okMarker >> filesize >> pieceCount >> fileSha1;
+    
+    if (okMarker != "OK") {
+        cerr << "[ERROR] " << response << endl;
         return;
     }
-
-    stringstream phss(line);
+    
+    // Store piece count for tracking
+    {
+        lock_guard<mutex> lock(downloadsMutex);
+        if (activeDownloads.count(downloadKey)) {
+            activeDownloads[downloadKey].totalPieces = pieceCount;
+        }
+    }
+    
+    // Read piece hashes
     vector<string> pieceHashes;
-    string h;
-    while (phss >> h) pieceHashes.push_back(h);
-
-    cout << "[METADATA] Loaded " << pieceHashes.size() << " piece hashes" << endl;
-
-    // Remaining lines: seeders
+    for (int i = 0; i < pieceCount; i++) {
+        if (!getline(ss, line)) {
+            cerr << "[ERROR] Missing piece hash " << i << endl;
+            return;
+        }
+        pieceHashes.push_back(line);
+    }
+    
+    // Read seeders
+    // Read seeders
     vector<Seeder> seeders;
     while (getline(ss, line)) {
-        if (line.empty()) continue;
+        if (line.empty() || line == "END") break;
+        
+        // Parse format: userId ip port filepath pieces
+        // But tracker sends: ip:port:filepath:pieces
 
-        Seeder s;
+        cout << line << endl;
+        
+        // Find colons
         size_t c1 = line.find(':');
         size_t c2 = line.find(':', c1 + 1);
         size_t c3 = line.find(':', c2 + 1);
-        if (c1 == string::npos || c2 == string::npos || c3 == string::npos) continue;
-
+        
+        if (c1 == string::npos || c2 == string::npos || c3 == string::npos) {
+            cerr << "[WARN] Malformed seeder line: " << line << endl;
+            continue;
+        }
+        
+        Seeder s;
         s.ip = line.substr(0, c1);
         s.port = stoi(line.substr(c1 + 1, c2 - c1 - 1));
-        s.filepath = line.substr(c2 + 1, c3 - c2 - 1);
-
+        s.filepath = line.substr(c2 + 1, c3 - c2 - 1);  // ← EXTRACT FILEPATH
+        
+        // Parse pieces (after 3rd colon)
         string piecesStr = line.substr(c3 + 1);
         stringstream ps(piecesStr);
         string p;
         while (getline(ps, p, ',')) {
-            if (!p.empty()) s.pieces.insert(stoi(p));
+            if (!p.empty() && p != " ") {
+                s.pieces.insert(stoi(p));
+            }
         }
-
+        
         seeders.push_back(s);
-
         cout << "[SEEDER] " << s.ip << ":" << s.port << endl;
         cout << "         Filepath: " << s.filepath << endl;
-        cout << "         Pieces: " << s.pieces.size() << " available" << endl;
+        cout << "         Pieces: " << s.pieces.size() << endl;
     }
-
-
-    if (seeders.empty()) {
+        if (seeders.empty()) {
         cerr << "[ERROR] No seeders available" << endl;
         return;
     }
-
-    
-    cout << "[SEEDERS] Total: " << seeders.size() << " seeder(s) found" << endl;
     
     // Create temp directory for pieces
     string tempDir = "/tmp/dl_" + filename + "_" + to_string(time(nullptr));
     system(("mkdir -p " + tempDir).c_str());
-    cout << "\n[TEMP] Created directory: " << tempDir << endl;
     
     // Track downloaded pieces
     vector<bool> downloaded(pieceCount, false);
     int completedPieces = 0;
     
-    cout << "\n==========================================" << endl;
-    cout << "        DOWNLOADING PIECES                 " << endl;
-    cout << "==========================================" << endl;
+    cout << "\n==========================================\n";
+    cout << "        DOWNLOADING PIECES\n";
+    cout << "==========================================\n";
     
     // Download pieces using rarest-first algorithm
     while (completedPieces < pieceCount) {
+        // Check if stop requested
+        {
+            lock_guard<mutex> lock(downloadsMutex);
+            if (activeDownloads.count(downloadKey) && activeDownloads[downloadKey].stopRequested) {
+                cout << "\n[STOPPED] Download cancelled by user\n";
+                system(("rm -rf " + tempDir).c_str());
+                return;
+            }
+        }
+        
         // Select rarest piece
         int pieceIndex = selectRarestPiece(downloaded, seeders, pieceCount);
         
@@ -353,25 +375,18 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
             expectedSize = filesize - ((long long)pieceIndex * PIECE_SIZE);
         }
         
-        cout << "\n[PIECE " << pieceIndex << "/" << (pieceCount-1) << "]" << endl;
-        cout << "[INFO] Expected size: " << expectedSize << " bytes" << endl;
-        
         // Try downloading from available seeders
         bool success = false;
         vector<unsigned char> pieceData;
         
         for (const auto& seeder : seeders) {
-            if (!seeder.pieces.count(pieceIndex)) {
-                continue;
-            }
+            if (!seeder.pieces.count(pieceIndex)) continue;
             
             if (downloadPieceFromPeer(seeder.ip, seeder.port, seeder.filepath, 
                                      pieceIndex, pieceData, pieceHashes[pieceIndex], 
-                                     expectedSize)) {
+                                     expectedSize, downloadKey)) {
                 success = true;
                 break;
-            } else {
-                cout << "[RETRY] Trying next seeder..." << endl;
             }
         }
         
@@ -391,6 +406,14 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
             downloaded[pieceIndex] = true;
             completedPieces++;
             
+            // Update tracking
+            {
+                lock_guard<mutex> lock(downloadsMutex);
+                if (activeDownloads.count(downloadKey)) {
+                    activeDownloads[downloadKey].completedPieces = completedPieces;
+                }
+            }
+            
             int progress = (completedPieces * 100) / pieceCount;
             cout << "\n[OVERALL PROGRESS] " << completedPieces << "/" << pieceCount 
                  << " pieces (" << progress << "%)" << endl;
@@ -409,9 +432,9 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
     }
     
     // Assemble final file
-    cout << "\n==========================================" << endl;
-    cout << "        ASSEMBLING FILE                    " << endl;
-    cout << "==========================================" << endl;
+    cout << "\n==========================================\n";
+    cout << "        ASSEMBLING FILE\n";
+    cout << "==========================================\n";
     
     // Determine final path
     struct stat info;
@@ -444,8 +467,6 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
         streamsize bytesRead = pieceFile.gcount();
         outFile.write(buffer.data(), bytesRead);
         pieceFile.close();
-        
-        cout << "[ASSEMBLY] Merged piece " << i << " (" << bytesRead << " bytes)" << endl;
     }
     
     outFile.close();
@@ -463,20 +484,15 @@ void downloadFile(string trackerIP, int trackerPort, string groupId,
                                    istreambuf_iterator<char>());
     finalFile.close();
     
-    cout << "[VERIFY] Read " << fileData.size() << " bytes from final file" << endl;
-    
     string computedSha = calculateSHA1(fileData.data(), fileData.size());
     
-    cout << "[VERIFY] Expected SHA1: " << fileSha1 << endl;
-    cout << "[VERIFY] Computed SHA1: " << computedSha << endl;
-    
     if (computedSha == fileSha1) {
-        cout << "\n==========================================" << endl;
+        cout << "\n==========================================\n";
         cout << "[C] [" << groupId << "] " << filename << endl;
-        cout << "==========================================" << endl;
+        cout << "==========================================\n";
         cout << "[SUCCESS] File saved to: " << finalPath << endl;
         cout << "[SUCCESS] Size: " << fileData.size() << " bytes" << endl;
-        cout << "==========================================\n" << endl;
+        cout << "==========================================\n\n";
     } else {
         cerr << "\n[ERROR] Final file hash mismatch!" << endl;
         cerr << "[ERROR] File may be corrupted" << endl;

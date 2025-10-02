@@ -6,23 +6,59 @@
 #include <unordered_map>
 #include <mutex>
 #include <map>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <thread>
-#include <functional>
-#include <chrono>
-
+#include <atomic>
 
 using namespace std;
 
 #define PIECE_SIZE (512*1024)
 
+// -------------------- Download status tracking --------------------
+enum DownloadStatus {
+    DOWNLOADING,
+    COMPLETED,
+    FAILED
+};
 
-// ==================== CLIENT SIDE ====================
+// -------------------- DownloadInfo --------------------
+struct DownloadInfo {
+    string groupId;
+    string filename;
+    string destPath;
+    DownloadStatus status;
+    int totalPieces = 0;
+    atomic<int> completedPieces;
+    atomic<bool> stopRequested;
 
-// Seeder info for download
+    DownloadInfo() : status(DOWNLOADING), totalPieces(0),
+                     completedPieces(0), stopRequested(false) {}
+
+    // Copy constructor
+    DownloadInfo(const DownloadInfo& other) {
+        groupId = other.groupId;
+        filename = other.filename;
+        destPath = other.destPath;
+        status = other.status;
+        totalPieces = other.totalPieces;
+        completedPieces.store(other.completedPieces.load());
+        stopRequested.store(other.stopRequested.load());
+    }
+
+    // Assignment operator
+    DownloadInfo& operator=(const DownloadInfo& other) {
+        if (this != &other) {
+            groupId = other.groupId;
+            filename = other.filename;
+            destPath = other.destPath;
+            status = other.status;
+            totalPieces = other.totalPieces;
+            completedPieces.store(other.completedPieces.load());
+            stopRequested.store(other.stopRequested.load());
+        }
+        return *this;
+    }
+};
+
+// -------------------- Seeder info --------------------
 struct Seeder {
     string userId;
     string ip;
@@ -31,45 +67,26 @@ struct Seeder {
     unordered_set<int> pieces;
 };
 
-// Upload/Download functions
-string send_upload_to_tracker(int sockfd, const string& userId, const string& groupId, 
+// -------------------- Global state --------------------
+extern string g_trackerIP;
+extern int g_trackerPort;
+
+extern map<string, DownloadInfo> activeDownloads; // key = groupId+filename
+extern mutex downloadsMutex;
+
+// -------------------- Function declarations --------------------
+string send_upload_to_tracker(int sockfd, const string& userId, const string& groupId,
                               const string& filepath, const string& clientIp, int clientPort);
 
-void downloadFileFromPeers(const string& filename, const string& destPath,
-                          long long filesize, const vector<string>& pieceHashes,
-                          const vector<Seeder>& seeders, const string& fileSha1);
+void downloadFile(string trackerIP, int trackerPort, string groupId,
+                  string filename, string destPath);
 
-string showDownloads();
-
-// Peer server functions
 void startPeerServer(int port);
-void addSharedFile(const string& filename, const string& filepath);
-void removeSharedFile(const string& filename);
 
-// Tracker-side upload handler
-string handle_upload_file(const string& cmdLine);
-
-// Utility functions
 string calculateSHA1(const unsigned char* data, size_t len);
 long long getFileSize(const string& filepath);
 
-// Helper function to receive full message
-// inline string recvAll(int sockfd) {
-//     string result;
-//     char buffer[4096];
-    
-//     while (true) {
-//         ssize_t n = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-//         if (n <= 0) break;
-        
-//         buffer[n] = '\0';
-//         result += buffer;
-        
-//         // Check if we have complete message (ends with newline or specific marker)
-//         if (result.find('\n') != string::npos || result.find("END") != string::npos) {
-//             break;
-//         }
-//     }
-    
-//     return result;
-// }
+// New functions for download management
+string showDownloads();
+string stopDownload(const string& groupId, const string& filename);
+string getDownloadKey(const string& groupId, const string& filename);
