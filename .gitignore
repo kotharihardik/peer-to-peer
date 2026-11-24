@@ -1,2 +1,17 @@
-1gb_file.dat
-imb_file.dat
+# build output
+*.o
+module1/tracker/tracker
+module1/client/client
+module2/peer
+
+# OS / editor junk
+.DS_Store
+
+# local test data
+*.dat
+
+# personal interview notes (not committed)
+interview_module_1.md
+code_walkthrough.md
+code_dumps_*.md
+full_project_code.md
